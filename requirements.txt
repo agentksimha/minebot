@@ -3,3 +3,4 @@ faiss-cpu
 sentence-transformers
 google-genai
 numpy
+rank-bm25
