@@ -1,16 +1,20 @@
 import asyncio
+import hashlib
+import hmac
 import io
 import os
 import re
+import secrets
 import sqlite3
 import textwrap
 import uuid
 from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from reportlab.lib.pagesizes import A4
@@ -32,6 +36,8 @@ GEMINI_SEMAPHORE = asyncio.Semaphore(1)
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))  # messages loaded per chat turn
 
 AUDIT_TIMEOUT = float(os.getenv("AUDIT_TIMEOUT", "60"))  # seconds (covers backoff + fallback)
+AUTH_TOKEN_TTL_DAYS = int(os.getenv("AUTH_TOKEN_TTL_DAYS", "30"))
+PASSWORD_ITERATIONS = 310_000
 
 # Bump when the pipeline/prompt changes so stale answers from older
 # architectures sitting in rag_cache.db are never served.
@@ -107,6 +113,117 @@ CREATE TABLE IF NOT EXISTS cache (
 )
 """)
 conn.commit()
+
+
+# -------------------------------------------------------
+# Authentication (accounts + revocable bearer sessions)
+# -------------------------------------------------------
+conn.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+""")
+conn.execute("""
+CREATE TABLE IF NOT EXISTS auth_tokens (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+)
+""")
+conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id)")
+conn.commit()
+
+
+def _normalize_email(value: str) -> str:
+    email = str(value or "").strip().lower()
+    if len(email) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        raise HTTPException(status_code=422, detail="Enter a valid email address.")
+    return email
+
+
+def _validate_password(value: str):
+    password = str(value or "")
+    if len(password) < 8:
+        raise HTTPException(status_code=422, detail="Password must be at least 8 characters.")
+    if len(password) > 256:
+        raise HTTPException(status_code=422, detail="Password is too long.")
+    return password
+
+
+def _hash_password(password: str, salt: bytes = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
+    return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def _verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, iterations, salt_hex, expected_hex = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        actual = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations)
+        )
+        return hmac.compare_digest(actual, bytes.fromhex(expected_hex))
+    except (TypeError, ValueError):
+        return False
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _public_user(row) -> dict:
+    return {"id": row[0], "name": row[1], "email": row[2]}
+
+
+def _issue_token(user_id: str) -> str:
+    token = secrets.token_urlsafe(48)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=AUTH_TOKEN_TTL_DAYS)
+    with conn:
+        conn.execute("DELETE FROM auth_tokens WHERE expires_at <= ?", (datetime.now(timezone.utc).isoformat(),))
+        conn.execute(
+            "INSERT INTO auth_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+            (_token_hash(token), user_id, expires_at.isoformat()),
+        )
+    return token
+
+
+def _bearer_token(authorization: str = Header(default="")) -> str:
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return token
+
+
+def current_user(token: str = Depends(_bearer_token)) -> dict:
+    row = conn.execute(
+        """SELECT u.id, u.name, u.email, t.expires_at
+           FROM auth_tokens t JOIN users u ON u.id = t.user_id
+           WHERE t.token_hash = ?""",
+        (_token_hash(token),),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=401, detail="Your session is invalid. Please sign in again.")
+    try:
+        expires_at = datetime.fromisoformat(row[3])
+    except ValueError:
+        expires_at = datetime.min.replace(tzinfo=timezone.utc)
+    if expires_at <= datetime.now(timezone.utc):
+        with conn:
+            conn.execute("DELETE FROM auth_tokens WHERE token_hash = ?", (_token_hash(token),))
+        raise HTTPException(status_code=401, detail="Your session has expired. Please sign in again.")
+    return {"id": row[0], "name": row[1], "email": row[2]}
 
 
 def get_from_l2(key):
@@ -263,19 +380,64 @@ async def cached_task(task_prompt: str, retrieval_query: str) -> str:
 # -------------------------------------------------------
 # Root + QUERY ENDPOINTS
 # -------------------------------------------------------
+@app.post("/auth/register", status_code=201)
+async def register(request: Request):
+    data = await request.json()
+    name = re.sub(r"\s+", " ", str(data.get("name") or "")).strip()
+    if len(name) < 2 or len(name) > 80:
+        raise HTTPException(status_code=422, detail="Name must be between 2 and 80 characters.")
+    email = _normalize_email(data.get("email"))
+    password = _validate_password(data.get("password"))
+    user_id = uuid.uuid4().hex
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO users (id, name, email, password_hash) VALUES (?, ?, ?, ?)",
+                (user_id, name, email, _hash_password(password)),
+            )
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="An account with this email already exists.")
+    return {"token": _issue_token(user_id), "user": {"id": user_id, "name": name, "email": email}}
+
+
+@app.post("/auth/login")
+async def login(request: Request):
+    data = await request.json()
+    email = _normalize_email(data.get("email"))
+    password = str(data.get("password") or "")
+    row = conn.execute(
+        "SELECT id, name, email, password_hash FROM users WHERE email = ?", (email,)
+    ).fetchone()
+    if not row or not _verify_password(password, row[3]):
+        raise HTTPException(status_code=401, detail="Incorrect email or password.")
+    return {"token": _issue_token(row[0]), "user": _public_user(row)}
+
+
+@app.get("/auth/me")
+async def auth_me(user: dict = Depends(current_user)):
+    return {"user": user}
+
+
+@app.post("/auth/logout")
+async def logout(token: str = Depends(_bearer_token)):
+    with conn:
+        conn.execute("DELETE FROM auth_tokens WHERE token_hash = ?", (_token_hash(token),))
+    return {"ok": True}
+
+
 @app.get("/")
 async def root():
     return {"message": "🦺 Digital Mine Safety Officer API is running!"}
 
 
 @app.post("/query")
-async def query_agent(request: Request):
-    """Body: {"query": str, "session_id": str (optional), "user_id": str (optional)}.
+async def query_agent(request: Request, user: dict = Depends(current_user)):
+    """Body: {"query": str, "session_id": str (optional)}.
     Without a session_id a new chat is created and its id is returned - send it back on the next
     message so the assistant remembers the conversation."""
     data = await request.json()
     query = str(data.get("query") or "").strip()
-    user_id = str(data.get("user_id") or "default")[:64]
+    user_id = user["id"]
     session_id = data.get("session_id")
     if not query:
         return {"response": "⚠️ Query is empty.", "session_id": session_id}
@@ -310,24 +472,23 @@ def _not_found():
 
 
 @app.get("/sessions")
-async def list_sessions(user_id: str = "default"):
-    return {"sessions": db_list_sessions(user_id[:64])}
+async def list_sessions(user: dict = Depends(current_user)):
+    return {"sessions": db_list_sessions(user["id"])}
 
 
 @app.post("/sessions")
-async def new_session(request: Request):
+async def new_session(request: Request, user: dict = Depends(current_user)):
     try:
         data = await request.json()
     except Exception:
         data = {}
-    user_id = str((data or {}).get("user_id") or "default")[:64]
     title = _make_title(str((data or {}).get("title") or "New chat"))
-    return {"session_id": db_create_session(user_id, title), "title": title}
+    return {"session_id": db_create_session(user["id"], title), "title": title}
 
 
 @app.get("/sessions/{session_id}")
-async def get_session(session_id: str, user_id: str = "default"):
-    session = db_get_session(session_id, user_id[:64])
+async def get_session(session_id: str, user: dict = Depends(current_user)):
+    session = db_get_session(session_id, user["id"])
     if not session:
         return _not_found()
     return {"id": session["id"], "title": session["title"], "updated_at": session["updated_at"],
@@ -335,9 +496,9 @@ async def get_session(session_id: str, user_id: str = "default"):
 
 
 @app.patch("/sessions/{session_id}")
-async def rename_session(session_id: str, request: Request):
+async def rename_session(session_id: str, request: Request, user: dict = Depends(current_user)):
     data = await request.json()
-    session = db_get_session(session_id, str(data.get("user_id") or "default")[:64])
+    session = db_get_session(session_id, user["id"])
     if not session:
         return _not_found()
     db_rename_session(session["id"], str(data.get("title") or "New chat"))
@@ -345,8 +506,8 @@ async def rename_session(session_id: str, request: Request):
 
 
 @app.delete("/sessions/{session_id}")
-async def delete_session(session_id: str, user_id: str = "default"):
-    session = db_get_session(session_id, user_id[:64])
+async def delete_session(session_id: str, user: dict = Depends(current_user)):
+    session = db_get_session(session_id, user["id"])
     if not session:
         return _not_found()
     db_delete_session(session["id"])
@@ -357,7 +518,7 @@ async def delete_session(session_id: str, user_id: str = "default"):
 # DGMS Updates Endpoint
 # -------------------------------------------------------
 @app.get("/updates")
-async def get_dgms_updates():
+async def get_dgms_updates(_user: dict = Depends(current_user)):
     updates = await asyncio.to_thread(fetch_dgms_updates, limit=5)
 
     async def analyze_update(item):
@@ -412,7 +573,7 @@ def _scope_terms(*values) -> str:
 
 
 @app.post("/audit_report_pdf")
-async def generate_audit_report_pdf(request: Request):
+async def generate_audit_report_pdf(request: Request, _user: dict = Depends(current_user)):
     data = await request.json()
     state = str(data.get("state", "All States"))
     year = str(data.get("year", "All Years"))
